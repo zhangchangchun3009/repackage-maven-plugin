@@ -1,7 +1,9 @@
 package pers.zcc;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -79,25 +81,81 @@ public class JarMojo extends AbstractMojo {
         try {
             // make temp dir
             File tempDir = makeWorkTempDir(outputDir, tempDirPath);
-            //copy app jar to temp dir
-            copy(finalName, tempDirPath, outputDir);
-            // unpack app jar at temp dir
-            unpackJar(finalName, tempDir);
-            //delete app jar in temp dir
-            delete(finalName, tempDir);
+
+            preHandle(outputDir, finalName, tempDirPath);
             // get dependency lib path
             File lib = getNestedJarsDir(tempDir, useLibRelativePath);
             checkNestedJarsDir(lib);
             // get all jar file names in lib dir
             repackNestedJarsUncompressed(lib);
-            // repackage all files of temp dir
-            repackJarUncompressed(finalName, "*", tempDir);
-            //copy new app jar
-            copy(finalName, "..", tempDir);
-            //remove temp dir
-            removeDir(tempDirPath, outputDir);
+
+            afterHandle(finalName, tempDirPath, tempDir);
         } catch (Exception e) {
             throw new MojoExecutionException("Error repackaging jar file " + finalJar, e);
+        }
+    }
+
+    private static void afterHandle(String finalName, String tempDirPath, File tempDir) throws Exception {
+        File afterCmdfile = null;
+        Process after = null;
+        try {
+            afterCmdfile = File.createTempFile("afterCmd", ".bat");
+            BufferedWriter bw = new BufferedWriter(new FileWriter(afterCmdfile));
+            bw.write("cd " + tempDir.getAbsolutePath());
+            bw.newLine();
+            // repackage all files of temp dir
+            bw.write("jar -cf0M " + finalName + " *");
+            bw.newLine();
+            //copy new app jar
+            bw.write("copy /Y " + finalName + " ..");
+            bw.newLine();
+            //cd ..
+            bw.write("cd ..");
+            bw.newLine();
+            //remove temp dir
+            bw.write("rmdir /S /Q " + tempDirPath);
+            bw.newLine();
+            bw.flush();
+            bw.close();
+            String cmd = "cmd /c " + afterCmdfile.getAbsolutePath();
+            after = RUNTIME.exec(cmd, null, tempDir);
+            after.waitFor();
+        } catch (Exception e) {
+            throw e;
+        } finally {
+            afterCmdfile.delete();
+        }
+    }
+
+    private static void preHandle(File outputDir, String finalName, String tempDirPath) throws Exception {
+        File cmdfile = null;
+        Process pre = null;
+        try {
+            cmdfile = File.createTempFile("preCmd", ".bat");
+            BufferedWriter bw = new BufferedWriter(new FileWriter(cmdfile));
+            bw.write("cd " + outputDir.getAbsolutePath());
+            bw.newLine();
+            //copy app jar to temp dir
+            bw.write("copy /Y " + finalName + " " + tempDirPath);
+            bw.newLine();
+
+            bw.write("cd " + tempDirPath);
+            bw.newLine();
+            // unpack app jar at temp dir
+            bw.write("jar -xf " + finalName);
+            bw.newLine();
+            //delete app jar in temp dir
+            bw.write("del /F /S /Q " + finalName);
+            bw.newLine();
+            bw.flush();
+            bw.close();
+            String cmd = "cmd /c " + cmdfile.getAbsolutePath();
+            pre = RUNTIME.exec(cmd, null, outputDir);
+            pre.waitFor();
+        } catch (Exception e) {
+            throw e;
+        } finally {
+            cmdfile.delete();
         }
     }
 
@@ -110,7 +168,8 @@ public class JarMojo extends AbstractMojo {
             throws IOException, InterruptedException, ExecutionException, MojoExecutionException {
         String cmd1 = "cmd /c dir /b *.jar";
         Process p1 = RUNTIME.exec(cmd1, null, lib);
-        ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        int processors = Runtime.getRuntime().availableProcessors();
+        ExecutorService executor = Executors.newFixedThreadPool(processors > 1 ? (processors - 1) : processors);
         try (InputStream in1 = p1.getInputStream();
                 BufferedReader br1 = new BufferedReader(new InputStreamReader(in1));) {
             List<CompletableFuture<Boolean>> cfList = new ArrayList<CompletableFuture<Boolean>>();
@@ -161,18 +220,7 @@ public class JarMojo extends AbstractMojo {
         File temp = new File(lib, jarName);
         try {
             temp.mkdir();
-
-            copy(jarFullName, jarName, lib);
-
-            unpackJar(jarFullName, temp);
-
-            delete(jarFullName, temp);
-
-            repackJarUncompressed(jarFullName, "*", temp);
-
-            copy(jarFullName, "..", temp);
-
-            removeDir(jarName, lib);
+            repackDependency(jarFullName, jarName, lib, temp);
         } catch (Exception e) {
             e.printStackTrace();
             return false;
@@ -180,35 +228,44 @@ public class JarMojo extends AbstractMojo {
         return true;
     }
 
-    private static void delete(String fileName, File cmdExeDir) throws IOException, InterruptedException {
-        String cmd = "cmd /c del /F /S /Q " + fileName;
-        syncExec(cmd, cmdExeDir);
-    }
+    private static void repackDependency(String jarFullName, String jarName, File lib, File temp) throws Exception {
+        File f = null;
+        Process p = null;
+        try {
+            f = File.createTempFile("repackCmd", ".bat");
+            BufferedWriter bw = new BufferedWriter(new FileWriter(f));
+            bw.write("cd " + lib.getAbsolutePath());
+            bw.newLine();
+            bw.write("copy /Y " + jarFullName + " " + jarName);
+            bw.newLine();
 
-    private static void copy(String fileName, String toDir, File cmdExeDir) throws IOException, InterruptedException {
-        String cmd = "cmd /c copy /Y " + fileName + " " + toDir;
-        syncExec(cmd, cmdExeDir);
-    }
-
-    private static void removeDir(String dir, File cmdExeDir) throws IOException, InterruptedException {
-        String cmd = "cmd /c rmdir /S /Q " + dir;
-        syncExec(cmd, cmdExeDir);
-    }
-
-    private static void unpackJar(String jarName, File cmdExeDir) throws IOException, InterruptedException {
-        String cmd = "cmd /c jar -xf " + jarName;
-        syncExec(cmd, cmdExeDir);
-    }
-
-    private static void repackJarUncompressed(String jarName, String dirsToPackWith, File cmdExeDir)
-            throws IOException, InterruptedException {
-        String cmd = "cmd /c jar -cf0M " + jarName + " " + dirsToPackWith;
-        syncExec(cmd, cmdExeDir);
-    }
-
-    private static void syncExec(String cmd, File cmdExeDir) throws IOException, InterruptedException {
-        Process p = RUNTIME.exec(cmd, null, cmdExeDir);
-        p.waitFor();
+            bw.write("cd " + jarName);
+            bw.newLine();
+            // unpack app jar at temp dir
+            bw.write("jar -xf " + jarFullName);
+            bw.newLine();
+            bw.write("del /F /S /Q " + jarFullName);
+            bw.newLine();
+            // repack app jar at temp dir
+            bw.write("jar -cf0M " + jarFullName + " *");
+            bw.newLine();
+            bw.write("copy /Y " + jarFullName + " ..");
+            bw.newLine();
+            bw.write("cd ..");
+            bw.newLine();
+            //delete app jar in temp dir
+            bw.write("rmdir /S /Q " + jarName);
+            bw.newLine();
+            bw.flush();
+            bw.close();
+            String cmd = "cmd /c " + f.getAbsolutePath();
+            p = RUNTIME.exec(cmd, null, lib);
+            p.waitFor();
+        } catch (Exception e) {
+            throw e;
+        } finally {
+            f.delete();
+        }
     }
 
 //    public static void main(String[] args) {
